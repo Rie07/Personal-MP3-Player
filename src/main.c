@@ -1,47 +1,45 @@
 /*
- * BCA182 Lab 2 - Personal MP3 Player
- * Step 5: codec + I2S test tone, LCD, on-board keys, UART console,
- *         potentiometer (PF6) -> DAC volume.
+ * BCA182 Lab 2 - Personal MP3 Player (RT-Spark, STM32F407, FreeRTOS)
  *
- * LEDs (verified):  Yellow = PB14, Green = PA1, Red = PA8 (active HIGH)
- * Result after start-up:
- *   GREEN  steady = codec found, set up, tone is playing (listen on the jack)
- *   RED    steady = codec did not answer on I2C, or a codec write failed
- *   YELLOW steady = I2S/DMA failed to start
+ * Buttons (all on board):
+ *   - LEFT / RIGHT = previous / next song (starts a 5 second window).
+ *   - UP = confirm the chosen song; if nothing is waiting, UP = stop / play.
+ *     Do nothing for 5 s = the current song carries on.
+ *   - DOWN = faster tempo (wraps back to the slowest).
+ *   - Potentiometer (PF6) = volume.
  *
- * Pins:
- *   I2S3  : MCK = PC7, WS = PA15, CK = PB3, SD = PB5   (AF6, DMA1 Stream7)
- *   I2C2  : see CODEC_I2C_PINSET below, codec address 0x10
+ * LEDs: Yellow = PB14 (playing), Red = PA8 (paused / stopped),
+ *       Green = PA1 (changing song).
  *
- * The codec register sequence follows the idea of RT-Thread's ES8388 driver
- * (Apache-2.0): mute, power up, I2S 16-bit / ratio 256, enable DAC + outputs,
- * then unmute.
+ * Threads (names follow the handout):
+ *   update_lcd_leds_thread  - draws the LCD, drives the LEDs
+ *   polling_buttons         - reads the keys, runs the selection flow
+ *   adjust_volume           - reads the potentiometer, sets codec volume
+ *   audio_task              - one-off start-up of the codec and the I2S stream
+ * The "Ticker" that steps through the notes and the 5 s "Timeout" are
+ * FreeRTOS software timers. The LCD is protected by lcd_mutex.
+ * The idle task puts the CPU to sleep (WFI) to save power.
  */
 #include "stm32f4xx_hal.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
+#include "timers.h"
 #include "lcd.h"
+#include "songs.h"
 #include <string.h>
 
 #define LED_YELLOW_PIN   GPIO_PIN_14   /* GPIOB */
 #define LED_GREEN_PIN    GPIO_PIN_1    /* GPIOA */
 #define LED_RED_PIN      GPIO_PIN_8    /* GPIOA */
 
-/* 1 -> try the board's 8 MHz crystal (HSE) first, fall back to the internal
- *      oscillator if it does not start. 0 -> always use the internal one.
- * The crystal gives a much cleaner audio clock than the internal oscillator. */
+/* 1 -> use the board's 8 MHz crystal (falls back to the internal oscillator) */
 #define USE_HSE          1
 
 /* 0 -> SCL = PF1, SDA = PF0      1 -> SCL = PB10, SDA = PB11 */
 #define CODEC_I2C_PINSET 0
 
-/* I2S3 data pin (SD):  0 -> PB5    1 -> PC12
- * If the jack only ever gives static, try the other option. */
-#define I2S_SD_PINSET    0
-
 #define ES8388_ADDR      0x10
-#define CODEC_OUT_VOL    0x10          /* 0x00 (quiet) .. 0x21 (max). Start low! */
 
 /* ES8388 registers */
 #define ES_CONTROL1      0x00
@@ -64,21 +62,59 @@
 #define ES_ROUT1VOL      0x2F
 #define ES_LOUT2VOL      0x30
 #define ES_ROUT2VOL      0x31
+#define CODEC_OUT_VOL    0x1C          /* analog output level (0x00..0x21) */
 
-/* 441 Hz square wave: 100 frames per cycle at 44.1 kHz, 20 cycles per buffer */
-#define TONE_FRAMES      2000
-#define TONE_AMPLITUDE   4000
+/* ---- audio stream ---- */
+#define AUDIO_FS         44108u        /* real sample rate from the I2S dividers */
+#define AUDIO_FRAMES     256           /* stereo frames per half buffer          */
+#define AUDIO_AMP        12000         /* tone level (max 32767)                 */
+
+/* ---- note timing ----
+ * Duration of a note in seconds = beat x tempo x BEAT_SCALE.
+ * Chosen by ear (bigger = slower). The last part of each note is a short
+ * silent gap. */
+#define BEAT_SCALE       6.0f      /* start value; the DOWN key changes it */
+#define BEAT_SCALE_MIN   1.0f      /* fastest */
+#define BEAT_SCALE_MAX   12.0f     /* slowest */
+#define GAP_FRACTION     0.15f
+#define GAP_MIN_MS       8.0f
 
 extern void xPortSysTickHandler(void);
 
 static I2C_HandleTypeDef hi2c2;
 static I2S_HandleTypeDef hi2s3;
 static DMA_HandleTypeDef hdma_spi3_tx;
-static uint16_t tone_buf[TONE_FRAMES * 2];     /* interleaved L,R */
+static UART_HandleTypeDef huart1;
+static ADC_HandleTypeDef hadc3;
+
+static uint16_t audio_buf[AUDIO_FRAMES * 2 * 2];   /* two halves, L/R interleaved */
+static volatile uint32_t synth_inc;                /* phase step per frame, 0 = silence */
+static uint32_t synth_phase;
+
 static int es_err;
-static volatile int codec_ready;      /* set once the codec is configured */
-static volatile int volume_pct = -1; /* 0..100, -1 = not read yet        */
+static volatile int codec_ready;
+static volatile int audio_state;                   /* 0 start, 1 ok, 2 no codec, 3 i2s fail, 4 codec write error */
+static volatile int volume_pct = -1;
 static SemaphoreHandle_t uart_mutex;
+
+static TimerHandle_t note_timer;
+static volatile int player_playing;
+static volatile int cur_song;                      /* 0 .. SONG_COUNT-1 */
+static int note_idx;
+static int tick_state;                             /* 0 = start a note, 1 = gap after it */
+static TickType_t gap_ticks;
+static volatile float beat_scale = BEAT_SCALE;   /* DOWN key makes it faster */
+
+/* ---- song selection flow ---- */
+#define CONFIRM_MS       5000          /* time to confirm a new song       */
+enum { UI_IDLE = 0, UI_CONFIRM = 1 };
+static volatile int ui_state = UI_IDLE;
+static volatile int pending_song;                 /* song chosen, waiting for OK */
+static volatile int confirm_expired;              /* set by the timeout          */
+static volatile TickType_t confirm_deadline;
+static TimerHandle_t confirm_timer;               /* the "Timeout": one shot, 5 s */
+static SemaphoreHandle_t lcd_mutex;
+static volatile int lcd_ready;
 
 void SysTick_Handler(void)
 {
@@ -88,12 +124,14 @@ void SysTick_Handler(void)
     }
 }
 
-void vApplicationIdleHook(void) { }
+/* Sleep mode: the CPU sleeps until the next interrupt whenever no task has work. */
+void vApplicationIdleHook(void) { __WFI(); }
 
 static void fatal(void) { for (;;) { } }
 
-/* PLL setup: 168 MHz system clock. VCO input is 1 MHz either way:
- *   HSE 8 MHz / 8 = 1 MHz,   HSI 16 MHz / 16 = 1 MHz */
+/* ------------------------------------------------------------------ */
+/* Clock: 168 MHz. VCO input is 1 MHz either way.                      */
+/* ------------------------------------------------------------------ */
 static HAL_StatusTypeDef pll_config(uint32_t source, uint32_t m)
 {
     RCC_OscInitTypeDef osc = {0};
@@ -109,8 +147,8 @@ static HAL_StatusTypeDef pll_config(uint32_t source, uint32_t m)
     osc.PLL.PLLState        = RCC_PLL_ON;
     osc.PLL.PLLSource       = source;
     osc.PLL.PLLM            = m;
-    osc.PLL.PLLN            = 336;           /* 1 MHz x 336 = 336 MHz */
-    osc.PLL.PLLP            = RCC_PLLP_DIV2; /* / 2         = 168 MHz */
+    osc.PLL.PLLN            = 336;
+    osc.PLL.PLLP            = RCC_PLLP_DIV2;
     osc.PLL.PLLQ            = 7;
     return HAL_RCC_OscConfig(&osc);
 }
@@ -139,6 +177,9 @@ static void SystemClock_Config(void)
     if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_5) != HAL_OK) fatal();
 }
 
+/* ------------------------------------------------------------------ */
+/* LEDs                                                                */
+/* ------------------------------------------------------------------ */
 static void leds_init(void)
 {
     GPIO_InitTypeDef g = {0};
@@ -159,7 +200,16 @@ static void leds_init(void)
     HAL_GPIO_WritePin(GPIOA, LED_GREEN_PIN | LED_RED_PIN, GPIO_PIN_RESET);
 }
 
-/* ---------------- I2C (codec control) ---------------- */
+static void leds_set(int yellow, int green, int red)
+{
+    HAL_GPIO_WritePin(GPIOB, LED_YELLOW_PIN, yellow ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, LED_GREEN_PIN,  green  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, LED_RED_PIN,    red    ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+/* ------------------------------------------------------------------ */
+/* I2C: codec control                                                  */
+/* ------------------------------------------------------------------ */
 static void codec_i2c_init(void)
 {
     GPIO_InitTypeDef g = {0};
@@ -207,21 +257,21 @@ static void es8388_init(void)
 
     es_w(ES_DACCONTROL3,  0x04);   /* mute while we configure           */
     es_w(ES_CONTROL2,     0x50);
-    es_w(ES_CHIPPOWER,    0x00);   /* power up everything               */
-    es_w(ES_MASTERMODE,   0x00);   /* codec is I2S slave, STM32 master  */
-    es_w(ES_DACPOWER,     0xC0);   /* DAC and outputs off for now       */
+    es_w(ES_CHIPPOWER,    0x00);
+    es_w(ES_MASTERMODE,   0x00);   /* codec is I2S slave                */
+    es_w(ES_DACPOWER,     0xC0);
     es_w(ES_CONTROL1,     0x12);
     es_w(ES_DACCONTROL1,  0x18);   /* I2S format, 16-bit                */
-    es_w(ES_DACCONTROL2,  0x02);   /* single speed, MCLK = 256 x fs     */
+    es_w(ES_DACCONTROL2,  0x02);   /* MCLK = 256 x fs                   */
     es_w(ES_DACCONTROL16, 0x00);
-    es_w(ES_DACCONTROL17, 0x90);   /* left DAC -> left mixer            */
-    es_w(ES_DACCONTROL20, 0x90);   /* right DAC -> right mixer          */
+    es_w(ES_DACCONTROL17, 0x90);
+    es_w(ES_DACCONTROL20, 0x90);
     es_w(ES_DACCONTROL21, 0x80);
     es_w(ES_DACCONTROL23, 0x00);
-    es_w(ES_DACCONTROL4,  0x00);   /* digital volume 0 dB               */
+    es_w(ES_DACCONTROL4,  0x00);   /* digital volume 0 dB (pot changes it) */
     es_w(ES_DACCONTROL5,  0x00);
-    es_w(ES_ADCPOWER,     0xFF);   /* ADC not used                      */
-    es_w(ES_DACPOWER,     0x3C);   /* DAC on, OUT1 + OUT2 on            */
+    es_w(ES_ADCPOWER,     0xFF);
+    es_w(ES_DACPOWER,     0x3C);   /* DAC + outputs on                  */
 
     es_w(ES_LOUT1VOL, CODEC_OUT_VOL);
     es_w(ES_ROUT1VOL, CODEC_OUT_VOL);
@@ -229,12 +279,15 @@ static void es8388_init(void)
     es_w(ES_ROUT2VOL, CODEC_OUT_VOL);
 
     es_w(ES_CHIPPOWER,    0xF0);   /* restart the codec state machine   */
-    es_w(ES_CHIPPOWER,    0x00);   /* now that MCLK/LRCK are stable     */
+    es_w(ES_CHIPPOWER,    0x00);
 
     es_w(ES_DACCONTROL3,  0x00);   /* unmute                            */
 }
 
-/* ---------------- I2S3 + DMA (audio data) ---------------- */
+/* ------------------------------------------------------------------ */
+/* I2S3 + DMA: audio stream. The DMA runs a circular buffer; each time  */
+/* a half is played, the callback refills it from the tone generator.   */
+/* ------------------------------------------------------------------ */
 void HAL_I2S_MspInit(I2S_HandleTypeDef *hi2s)
 {
     GPIO_InitTypeDef g = {0};
@@ -252,19 +305,12 @@ void HAL_I2S_MspInit(I2S_HandleTypeDef *hi2s)
     g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
     g.Alternate = GPIO_AF6_SPI3;
 
-    g.Pin = GPIO_PIN_15;                      /* PA15 = WS  */
+    g.Pin = GPIO_PIN_15;                      /* PA15 = WS            */
     HAL_GPIO_Init(GPIOA, &g);
-#if I2S_SD_PINSET == 0
-    g.Pin = GPIO_PIN_3 | GPIO_PIN_5;          /* PB3 = CK, PB5 = SD */
+    g.Pin = GPIO_PIN_3 | GPIO_PIN_5;          /* PB3 = CK, PB5 = SD   */
     HAL_GPIO_Init(GPIOB, &g);
-    g.Pin = GPIO_PIN_7;                       /* PC7 = MCK  */
+    g.Pin = GPIO_PIN_7;                       /* PC7 = MCK            */
     HAL_GPIO_Init(GPIOC, &g);
-#else
-    g.Pin = GPIO_PIN_3;                       /* PB3 = CK   */
-    HAL_GPIO_Init(GPIOB, &g);
-    g.Pin = GPIO_PIN_7 | GPIO_PIN_12;         /* PC7 = MCK, PC12 = SD */
-    HAL_GPIO_Init(GPIOC, &g);
-#endif
 
     hdma_spi3_tx.Instance                 = DMA1_Stream7;
     hdma_spi3_tx.Init.Channel             = DMA_CHANNEL_0;
@@ -288,26 +334,44 @@ void DMA1_Stream7_IRQHandler(void)
     HAL_DMA_IRQHandler(&hdma_spi3_tx);
 }
 
-/* Triangle wave. period = frames per cycle: 100 -> 441 Hz, 50 -> 882 Hz,
- * 200 -> 220 Hz at 44.1 kHz. amp = 0 gives silence. */
-static void tone_fill(int amp, int period)
+/* Triangle wave at the current pitch. synth_inc = 0 gives silence. */
+static void audio_fill(uint16_t *dst, int frames)
 {
-    int half = period / 2;
-    for (int i = 0; i < TONE_FRAMES; i++) {
-        int p = i % period;
-        int s = (p < half) ? (-amp + (2 * amp * p) / half)
-                           : ( amp - (2 * amp * (p - half)) / half);
-        tone_buf[2 * i]     = (uint16_t)(int16_t)s;   /* left  */
-        tone_buf[2 * i + 1] = (uint16_t)(int16_t)s;   /* right */
+    uint32_t inc = synth_inc;
+    uint32_t ph  = synth_phase;
+
+    for (int i = 0; i < frames; i++) {
+        int16_t s = 0;
+        if (inc) {
+            int32_t x = (int32_t)(ph >> 16);                    /* 0..65535 */
+            int32_t v = (x < 32768) ? (x * 2 - 32768)
+                                    : (32767 - (x - 32768) * 2);
+            s = (int16_t)((v * AUDIO_AMP) >> 15);
+            ph += inc;
+        }
+        dst[2 * i]     = (uint16_t)s;     /* left  */
+        dst[2 * i + 1] = (uint16_t)s;     /* right */
     }
+    synth_phase = ph;
+}
+
+void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s)
+{
+    (void)hi2s;
+    audio_fill(&audio_buf[0], AUDIO_FRAMES);                /* first half just played */
+}
+
+void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s)
+{
+    (void)hi2s;
+    audio_fill(&audio_buf[AUDIO_FRAMES * 2], AUDIO_FRAMES); /* second half just played */
 }
 
 static void audio_i2s_init(void)
 {
     RCC_PeriphCLKInitTypeDef pc = {0};
 
-    /* PLLI2S: 1 MHz x 271 / 2 = 135.5 MHz.
-     * With MCLK on: 135.5 MHz / (256 x 12) = 44.108 kHz (about 44.1 kHz). */
+    /* PLLI2S: 1 MHz x 271 / 2 = 135.5 MHz -> 44.108 kHz with MCLK on */
     pc.PeriphClockSelection = RCC_PERIPHCLK_I2S;
     pc.PLLI2S.PLLI2SN       = 271;
     pc.PLLI2S.PLLI2SR       = 2;
@@ -325,7 +389,6 @@ static void audio_i2s_init(void)
     if (HAL_I2S_Init(&hi2s3) != HAL_OK) fatal();
 }
 
-/* ---------------- test task ---------------- */
 static void audio_task(void *arg)
 {
     (void)arg;
@@ -334,15 +397,14 @@ static void audio_task(void *arg)
     codec_i2c_init();
 
     if (HAL_I2C_IsDeviceReady(&hi2c2, ES8388_ADDR << 1, 3, 20) != HAL_OK) {
-        HAL_GPIO_WritePin(GPIOA, LED_RED_PIN, GPIO_PIN_SET);
-        for (;;) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+        audio_state = 2;
+        vTaskDelete(NULL);
     }
 
-    tone_fill(TONE_AMPLITUDE, 100);
     audio_i2s_init();
-    if (HAL_I2S_Transmit_DMA(&hi2s3, tone_buf, TONE_FRAMES * 2) != HAL_OK) {
-        HAL_GPIO_WritePin(GPIOB, LED_YELLOW_PIN, GPIO_PIN_SET);
-        for (;;) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    if (HAL_I2S_Transmit_DMA(&hi2s3, audio_buf, AUDIO_FRAMES * 2 * 2) != HAL_OK) {
+        audio_state = 3;
+        vTaskDelete(NULL);
     }
 
     vTaskDelay(pdMS_TO_TICKS(50));            /* MCLK/BCLK/LRCK are running */
@@ -350,18 +412,105 @@ static void audio_task(void *arg)
 
     if (es_err == 0) {
         codec_ready = 1;
-        HAL_GPIO_WritePin(GPIOA, LED_GREEN_PIN, GPIO_PIN_SET);
+        audio_state = 1;
     } else {
-        HAL_GPIO_WritePin(GPIOA, LED_RED_PIN, GPIO_PIN_SET);
+        audio_state = 4;
     }
-
-    for (;;) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    vTaskDelete(NULL);
 }
 
-/* ---------------- UART console (USART1: PA9 = TX, PA10 = RX) ---------------- */
-/* Goes through the ST-Link USB cable: open the COM port at 115200 baud. */
-static UART_HandleTypeDef huart1;
+/* ------------------------------------------------------------------ */
+/* Player: the "Ticker" that walks through the notes                   */
+/* ------------------------------------------------------------------ */
+static uint32_t freq_to_inc(float hz)
+{
+    return (uint32_t)((double)hz * 4294967296.0 / (double)AUDIO_FS);
+}
 
+static TickType_t ms_to_ticks(float ms)
+{
+    TickType_t t = (TickType_t)(ms * (float)configTICK_RATE_HZ / 1000.0f + 0.5f);
+    return (t < 1) ? 1 : t;
+}
+
+/* Runs in the FreeRTOS timer task. State 0 starts the next note and waits
+ * for its sounding time; state 1 is the short silent gap that follows. */
+static void player_tick(TimerHandle_t t)
+{
+    (void)t;
+    int s = cur_song;
+
+    if (!player_playing) {
+        synth_inc = 0;
+        return;
+    }
+
+    if (tick_state == 0) {
+        if (note_idx >= song_length(s)) {         /* song finished */
+            player_playing = 0;
+            synth_inc = 0;
+            note_idx = 0;
+            return;
+        }
+        float period_ms = song_note(s, note_idx);
+        float dur_ms    = song_beat(s, note_idx) * song_tempo(s) * beat_scale * 1000.0f;
+        float gap_ms    = dur_ms * GAP_FRACTION;
+        if (gap_ms < GAP_MIN_MS) gap_ms = GAP_MIN_MS;
+        float on_ms     = dur_ms - gap_ms;
+        if (on_ms < GAP_MIN_MS) on_ms = GAP_MIN_MS;
+
+        synth_inc = (period_ms > 0.0f) ? freq_to_inc(1000.0f / period_ms) : 0;   /* 0 = rest */
+        gap_ticks = ms_to_ticks(gap_ms);
+        tick_state = 1;
+        xTimerChangePeriod(note_timer, ms_to_ticks(on_ms), 0);
+    } else {
+        synth_inc = 0;                            /* silent gap */
+        note_idx++;
+        tick_state = 0;
+        xTimerChangePeriod(note_timer, gap_ticks, 0);
+    }
+}
+
+/* Stop: silence and back to the start of the song. */
+static void player_stop(void)
+{
+    player_playing = 0;
+    xTimerStop(note_timer, 0);
+    synth_inc = 0;
+    note_idx = 0;
+    tick_state = 0;
+}
+
+/* Play the current song from the beginning. */
+static void player_start(void)
+{
+    note_idx = 0;
+    tick_state = 0;
+    player_playing = 1;
+    xTimerChangePeriod(note_timer, 1, 0);         /* first note in 1 ms */
+}
+
+/* Pause: silence, but remember where we are. */
+static void player_pause(void)
+{
+    player_playing = 0;
+    xTimerStop(note_timer, 0);
+    synth_inc = 0;
+    tick_state = 0;
+}
+
+/* Resume from the remembered note (or from the start after the song ended). */
+static void player_resume(void)
+{
+    if (note_idx >= song_length(cur_song)) note_idx = 0;
+    tick_state = 0;
+    player_playing = 1;
+    xTimerChangePeriod(note_timer, 1, 0);
+}
+
+/* ------------------------------------------------------------------ */
+/* UART console (USART1: PA9 = TX, PA10 = RX), through the ST-Link USB */
+/* ------------------------------------------------------------------ */
 static void uart_init(void)
 {
     GPIO_InitTypeDef g = {0};
@@ -394,9 +543,23 @@ static void uart_print(const char *s)
     xSemaphoreGive(uart_mutex);
 }
 
-/* ---------------- Potentiometer on PF6 (ADC3, channel 4) ---------------- */
-static ADC_HandleTypeDef hadc3;
+/* tiny integer formatting: no printf in the firmware */
+static void uart_print_int(int v)
+{
+    char b[12];
+    int n = 0;
+    if (v < 0) { b[n++] = '-'; v = -v; }
+    char d[10];
+    int k = 0;
+    do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (k) b[n++] = d[--k];
+    b[n] = 0;
+    uart_print(b);
+}
 
+/* ------------------------------------------------------------------ */
+/* Potentiometer on PF6 (ADC3 channel 4)                               */
+/* ------------------------------------------------------------------ */
 static void pot_init(void)
 {
     GPIO_InitTypeDef g = {0};
@@ -425,11 +588,10 @@ static void pot_init(void)
 
     ch.Channel      = ADC_CHANNEL_4;
     ch.Rank         = 1;
-    ch.SamplingTime = ADC_SAMPLETIME_480CYCLES;   /* slow = good for a pot */
+    ch.SamplingTime = ADC_SAMPLETIME_480CYCLES;
     if (HAL_ADC_ConfigChannel(&hadc3, &ch) != HAL_OK) fatal();
 }
 
-/* Average of 8 readings, 0..4095 */
 static uint32_t pot_read(void)
 {
     uint32_t sum = 0;
@@ -442,37 +604,121 @@ static uint32_t pot_read(void)
     return sum / 8;
 }
 
-/* DAC digital volume: 0x00 = 0 dB, each step = -0.5 dB, 0xC0 = -96 dB.
- * Pot 0 % = mute, 1..100 % = -60 dB .. 0 dB. */
+/* DAC digital volume: 0x00 = 0 dB, 0.5 dB per step. Pot 0 % = mute. */
 static uint8_t volume_to_codec(int pct)
 {
     if (pct <= 0) return 0xC0;
-    return (uint8_t)(((100 - pct) * 120) / 100);
+    return (uint8_t)(((100 - pct) * 120) / 100);   /* 0 dB .. -60 dB */
 }
 
-static const char banner[] =
-    "\r\n=== Personal MP3 Player (BCA182 Lab 2) ===\r\n"
-    "Song number: hold B2-B4 (binary), then press B1 to select.\r\n"
-    "Press B1 again within 5 seconds to confirm, otherwise nothing changes.\r\n"
-    "Stop / play: press the stop-play button.\r\n"
-    "Volume: turn the potentiometer.\r\n"
-    "Buttons: B1 = UP, B2 = LEFT, B3 = DOWN, B4 = RIGHT (on-board keys).\r\n\r\n";
+/* ------------------------------------------------------------------ */
+/* LCD helpers. Every LCD access holds lcd_mutex: the LCD is shared by */
+/* the LCD thread and the volume thread.                               */
+/* ------------------------------------------------------------------ */
 
-/* This will become the "adjust volume" thread. */
-static void volume_task(void *arg)
+/* Text in a fixed 15-character field (240 px at scale 2). Caller holds the mutex. */
+static void draw_field(uint16_t y, const char *s, uint16_t fg)
+{
+    char buf[16];
+    int i = 0;
+    for (; i < 15 && s[i]; i++) buf[i] = s[i];
+    for (; i < 15; i++) buf[i] = ' ';
+    buf[15] = 0;
+    lcd_draw_string(0, y, buf, 2, fg, LCD_BLUE);
+}
+
+/* Small text in a fixed 30-character field. Caller holds the mutex. */
+static void draw_small(uint16_t y, const char *s, uint16_t fg)
+{
+    char buf[31];
+    int i = 0;
+    for (; i < 30 && s[i]; i++) buf[i] = s[i];
+    for (; i < 30; i++) buf[i] = ' ';
+    buf[30] = 0;
+    lcd_draw_string(0, y, buf, 1, fg, LCD_BLUE);
+}
+
+/* Tiny text builders (no printf in the firmware). They return the new length. */
+static int put_str(char *buf, int n, const char *s)
+{
+    while (*s) buf[n++] = *s++;
+    return n;
+}
+
+static int put_uint(char *buf, int n, int v)
+{
+    char d[6];
+    int k = 0;
+    do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (k) buf[n++] = d[--k];
+    return n;
+}
+
+/* "N.N" or "NN.N" */
+static void scale_to_text(float v, char *out)
+{
+    int t = (int)(v * 10.0f + 0.5f);
+    int n = 0;
+    if (t >= 100) out[n++] = (char)('0' + (t / 100) % 10);
+    out[n++] = (char)('0' + (t / 10) % 10);
+    out[n++] = '.';
+    out[n++] = (char)('0' + t % 10);
+    out[n] = 0;
+}
+
+static void draw_volume(int pct)
+{
+    char line[16];
+
+    memcpy(line, "VOLUME ", 7);
+    line[7]  = (pct >= 100) ? '1' : ' ';
+    line[8]  = (pct >= 10) ? (char)('0' + (pct / 10) % 10) : ' ';
+    line[9]  = (char)('0' + pct % 10);
+    line[10] = '%';
+    line[11] = 0;
+
+    xSemaphoreTake(lcd_mutex, portMAX_DELAY);
+    draw_field(180, line, LCD_YELLOW);
+    xSemaphoreGive(lcd_mutex);
+}
+
+/* ------------------------------------------------------------------ */
+/* UART instructions                                                    */
+/* ------------------------------------------------------------------ */
+static void print_banner(void)
+{
+    uart_print("\r\n=== Personal MP3 Player (BCA182 Lab 2) ===\r\n\r\nSongs:\r\n");
+    for (int i = 0; i < SONG_COUNT; i++) {
+        uart_print("  ");
+        uart_print_int(i + 1);
+        uart_print(". ");
+        uart_print(song_name1(i));
+        uart_print(" ");
+        uart_print(song_name2(i));
+        uart_print("\r\n");
+    }
+    uart_print("\r\nHow to use:\r\n");
+    uart_print(" LEFT / RIGHT : choose the previous / next song.\r\n");
+    uart_print(" UP           : confirm the chosen song within 5 seconds; if you do nothing,\r\n");
+    uart_print("                the current song carries on. With no choice pending, UP = stop / play.\r\n");
+    uart_print(" DOWN         : faster tempo (wraps back to the slowest).\r\n");
+    uart_print(" Potentiometer: volume.\r\n\r\n");
+    uart_print("LEDs: yellow = playing, red = paused / stopped, green = changing song.\r\n\r\n");
+}
+
+/* Handout name: adjust_volume thread */
+static void adjust_volume(void *arg)
 {
     (void)arg;
     int last = -100;
-    char buf[32];
 
     vTaskDelay(pdMS_TO_TICKS(500));
-    uart_print(banner);
+    print_banner();
 
     for (;;) {
         int pct = (int)((pot_read() * 100U + 2047U) / 4095U);
         if (pct > 100) pct = 100;
 
-        /* act only on real changes (>= 2 %) so the pot does not jitter */
         if (pct - last >= 2 || last - pct >= 2 ||
             (pct == 0 && last != 0) || (pct == 100 && last != 100)) {
             last = pct;
@@ -483,24 +729,19 @@ static void volume_task(void *arg)
                 es_w(ES_DACCONTROL4, v);
                 es_w(ES_DACCONTROL5, v);
             }
-            /* "Volume: NNN%\r\n" built by hand (no printf in the firmware) */
-            {
-                int n = 0;
-                const char *p = "Volume: ";
-                while (*p) buf[n++] = *p++;
-                if (pct >= 100) buf[n++] = '1';
-                if (pct >= 10)  buf[n++] = (char)('0' + (pct / 10) % 10);
-                buf[n++] = (char)('0' + pct % 10);
-                buf[n++] = '%'; buf[n++] = '\r'; buf[n++] = '\n'; buf[n] = 0;
-            }
-            uart_print(buf);
+            uart_print("Volume: ");
+            uart_print_int(pct);
+            uart_print("%\r\n");
+            if (lcd_ready) draw_volume(pct);
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-/* ---------------- On-board keys (active LOW, internal pull-up, GPIOC) ----------------
- *   UP = PC5, DOWN = PC1, LEFT = PC0, RIGHT = PC4 */
+/* ------------------------------------------------------------------ */
+/* On-board keys (active LOW, internal pull-up, GPIOC)                 */
+/*   B1 = UP (PC5)   B2 = LEFT (PC0)   B3 = DOWN (PC1)   B4 = RIGHT (PC4) */
+/* ------------------------------------------------------------------ */
 #define KEY_UP_PIN     GPIO_PIN_5
 #define KEY_DOWN_PIN   GPIO_PIN_1
 #define KEY_LEFT_PIN   GPIO_PIN_0
@@ -523,91 +764,248 @@ static int key_pressed(uint16_t pin)
     return HAL_GPIO_ReadPin(GPIOC, pin) == GPIO_PIN_RESET;
 }
 
-/* Draw one row of the key test; only redraws when the state changes. */
-static void show_key(uint16_t y, const char *name, uint16_t pin, int *last)
+/* The "Timeout": runs once, 5 s after a song was selected. Nothing was
+ * confirmed, so everything carries on as before. */
+static void confirm_timeout(TimerHandle_t t)
 {
-    int now = key_pressed(pin);
-    if (now == *last) return;
-    *last = now;
-
-    lcd_draw_string(0, y, name, 2, LCD_WHITE, LCD_BLUE);
-    lcd_draw_string(96, y, now ? "PRESSED" : "-------", 2,
-                    now ? LCD_GREEN : LCD_WHITE, LCD_BLUE);
+    (void)t;
+    ui_state = UI_IDLE;
+    confirm_expired = 1;
 }
 
-static void draw_tone_line(int on, const char *freq)
+static void announce(const char *prefix, int song)
 {
-    char s[16];
-    memcpy(s, on ? "TONE ON  " : "TONE OFF ", 9);
-    memcpy(s + 9, freq, 3);
-    s[12] = 'H'; s[13] = 'z'; s[14] = 0;
-    lcd_draw_string(0, 172, s, 2, LCD_YELLOW, LCD_BLUE);
+    uart_print(prefix);
+    uart_print_int(song + 1);
+    uart_print(": ");
+    uart_print(song_name1(song));
+    uart_print(" ");
+    uart_print(song_name2(song));
 }
 
-/* LCD task: title, the four on-board keys, tone status and the volume.
- * Only this task draws on the LCD for now, so no mutex is needed yet.
- * LEFT = tone on/off (silence test), UP = change the tone pitch. */
-static void lcd_test_task(void *arg)
+/* LEFT / RIGHT: move to the previous / next song and (re)start the 5 s window. */
+static void browse(int dir)
+{
+    int s = (ui_state == UI_CONFIRM) ? pending_song : cur_song;
+
+    pending_song = (s + SONG_COUNT + dir) % SONG_COUNT;
+    confirm_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIRM_MS);
+    ui_state = UI_CONFIRM;
+    xTimerChangePeriod(confirm_timer, pdMS_TO_TICKS(CONFIRM_MS), 0);   /* restarts the Timeout */
+
+    announce("Choose song ", pending_song);
+    uart_print("  - press UP within 5 seconds to confirm\r\n");
+}
+
+/* UP while a song is waiting for confirmation: switch to it and play it. */
+static void confirm_song(void)
+{
+    int declared, notes, beats;
+
+    xTimerStop(confirm_timer, 0);
+    ui_state = UI_IDLE;
+    player_stop();
+    cur_song = pending_song;
+    player_start();
+
+    announce("Confirmed. Playing song ", cur_song);
+    song_counts(cur_song, &declared, &notes, &beats);
+    uart_print("  (length ");
+    uart_print_int(declared);
+    uart_print(", notes ");
+    uart_print_int(notes);
+    uart_print(", beats ");
+    uart_print_int(beats);
+    uart_print(")\r\n");
+}
+
+/* UP with nothing waiting for confirmation: stop / play. */
+static void toggle_play(void)
+{
+    if (player_playing) {
+        player_pause();
+        uart_print("Paused.\r\n");
+    } else {
+        player_resume();
+        uart_print("Playing.\r\n");
+    }
+}
+
+/* DOWN: faster tempo, 15 % per press; after the fastest it wraps to the slowest. */
+static void change_speed(void)
+{
+    char b[8];
+    float v = beat_scale * 0.85f;
+
+    if (v < BEAT_SCALE_MIN) v = BEAT_SCALE_MAX;
+    beat_scale = v;
+
+    scale_to_text(v, b);
+    uart_print("Tempo scale: ");
+    uart_print(b);
+    uart_print("  (lower = faster)\r\n");
+}
+
+/* Handout name: polling_buttons thread. A key counts after it reads the
+ * same twice in a row, 20 ms apart (debounce); each press acts once.
+ *   LEFT / RIGHT = previous / next song     UP = confirm, or stop / play
+ *   DOWN = faster tempo */
+static void polling_buttons(void *arg)
 {
     (void)arg;
-    static const int   periods[3] = { 100, 50, 200 };
-    static const char *freqs[3]   = { "441", "882", "220" };
-    int up = -1, down = -1, left = -1, right = -1;
-    int shown_volume = -2;
-    int tone_on = 1;
-    int pitch = 0;
-    char line[16];
+    int last_raw[4] = { 0, 0, 0, 0 };
+    int stable[4]   = { 0, 0, 0, 0 };     /* 0 = UP, 1 = LEFT, 2 = DOWN, 3 = RIGHT */
 
     keys_init();
-    lcd_init();
-    lcd_fill(LCD_BLUE);
-    lcd_draw_string(0, 6, "MP3 PLAYER", 3, LCD_WHITE, LCD_BLUE);   /* 10 chars x 24 px = 240 px */
-    draw_tone_line(tone_on, freqs[pitch]);
 
     for (;;) {
-        int prev_up = up;
-        int prev_left = left;
+        int raw[4] = { key_pressed(KEY_UP_PIN),   key_pressed(KEY_LEFT_PIN),
+                       key_pressed(KEY_DOWN_PIN), key_pressed(KEY_RIGHT_PIN) };
+        int prev[4] = { stable[0], stable[1], stable[2], stable[3] };
 
-        show_key( 56, "UP   ", KEY_UP_PIN,    &up);
-        show_key( 84, "DOWN ", KEY_DOWN_PIN,  &down);
-        show_key(112, "LEFT ", KEY_LEFT_PIN,  &left);
-        show_key(140, "RIGHT", KEY_RIGHT_PIN, &right);
-
-        if ((left == 1 && prev_left == 0) || (up == 1 && prev_up == 0)) {
-            if (left == 1 && prev_left == 0) tone_on = !tone_on;
-            if (up == 1 && prev_up == 0)     pitch = (pitch + 1) % 3;
-            tone_fill(tone_on ? TONE_AMPLITUDE : 0, periods[pitch]);
-            draw_tone_line(tone_on, freqs[pitch]);
+        for (int i = 0; i < 4; i++) {
+            if (raw[i] == last_raw[i]) stable[i] = raw[i];
+            last_raw[i] = raw[i];
         }
 
-        if (volume_pct != shown_volume && volume_pct >= 0) {
-            shown_volume = volume_pct;
-            /* "VOLUME NNN%" with the number right-aligned in 3 characters */
-            memcpy(line, "VOLUME ", 7);
-            line[7]  = (shown_volume >= 100) ? '1' : ' ';
-            line[8]  = (shown_volume >= 10) ? (char)('0' + (shown_volume / 10) % 10) : ' ';
-            line[9]  = (char)('0' + shown_volume % 10);
-            line[10] = '%';
-            line[11] = 0;
-            lcd_draw_string(0, 206, line, 2, LCD_YELLOW, LCD_BLUE);
+        if (stable[0] && !prev[0]) {                     /* UP pressed */
+            if (ui_state == UI_CONFIRM) confirm_song();
+            else                        toggle_play();
         }
-        vTaskDelay(pdMS_TO_TICKS(30));
+        if (stable[1] && !prev[1]) browse(-1);           /* LEFT pressed  */
+        if (stable[3] && !prev[3]) browse(+1);           /* RIGHT pressed */
+        if (stable[2] && !prev[2]) change_speed();       /* DOWN pressed  */
+
+        if (confirm_expired) {
+            confirm_expired = 0;
+            uart_print("No confirmation: the current song carries on.\r\n");
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* LCD + LEDs thread                                                    */
+/* ------------------------------------------------------------------ */
+
+/* Handout name: update_lcd_leds_thread */
+static void update_lcd_leds_thread(void *arg)
+{
+    (void)arg;
+    int shown_song = -1, shown_confirm = -1, shown_status = -1, shown_scale = -1;
+    char line[24];
+
+    xSemaphoreTake(lcd_mutex, portMAX_DELAY);
+    lcd_init();
+    lcd_fill(LCD_BLUE);                                      /* clear the display */
+    lcd_draw_string(0, 2, "MP3 PLAYER", 3, LCD_WHITE, LCD_BLUE);   /* 10 chars x 24 px = 240 px */
+    draw_small(212, "L/R=song UP=OK/play DOWN=tempo", LCD_WHITE);
+    xSemaphoreGive(lcd_mutex);
+    lcd_ready = 1;
+    if (volume_pct >= 0) draw_volume(volume_pct);
+    leds_set(0, 0, 1);
+
+    for (;;) {
+        int confirming = (ui_state == UI_CONFIRM);
+        int song       = confirming ? pending_song : cur_song;
+        int playing    = player_playing;
+        int audio      = audio_state;
+        int secs       = 0;
+        int status;
+
+        if (confirming) {
+            TickType_t now = xTaskGetTickCount();
+            TickType_t left = (confirm_deadline > now) ? (confirm_deadline - now) : 0;
+            secs = (int)(left / configTICK_RATE_HZ) + 1;
+        }
+
+        if (audio >= 2)       status = 100 + audio;
+        else if (audio == 0)  status = 90;
+        else if (confirming)  status = 50 + secs;
+        else if (playing)     status = 1;
+        else                  status = (note_idx > 0) ? 2 : 0;       /* 2 = paused, 0 = stopped */
+
+        xSemaphoreTake(lcd_mutex, portMAX_DELAY);
+
+        if (song != shown_song || confirming != shown_confirm) {
+            int n;
+            shown_song = song;
+            shown_confirm = confirming;
+            n = put_str(line, 0, confirming ? "CHANGE TO " : "SONG ");   /* "SONG 3/10" */
+            n = put_uint(line, n, song + 1);
+            n = put_str(line, n, "/");
+            n = put_uint(line, n, SONG_COUNT);
+            line[n] = 0;
+            draw_field(52,  line, confirming ? LCD_GREEN : LCD_YELLOW);
+            draw_field(84,  song_name1(song), LCD_WHITE);
+            draw_field(116, song_name2(song), LCD_WHITE);
+        }
+
+        if (status != shown_status) {
+            shown_status = status;
+            if (status >= 102) {
+                memcpy(line, "AUDIO ERROR  ", 13);
+                line[12] = (char)('0' + audio);
+                line[13] = 0;
+                draw_field(148, line, LCD_RED);
+            } else if (status == 90) {
+                draw_field(148, "STARTING...", LCD_WHITE);
+            } else if (confirming) {
+                memcpy(line, "CONFIRM: UP ", 12);             /* "CONFIRM: UP 5s" */
+                line[12] = (char)('0' + (secs > 9 ? 9 : secs));
+                line[13] = 's';
+                line[14] = 0;
+                draw_field(148, line, LCD_GREEN);
+            } else if (status == 1) {
+                draw_field(148, "PLAYING", LCD_GREEN);
+            } else if (status == 2) {
+                draw_field(148, "PAUSED", LCD_YELLOW);
+            } else {
+                draw_field(148, "STOPPED", LCD_YELLOW);
+            }
+
+            if (confirming)     leds_set(0, 1, 0);          /* changing song: green */
+            else if (playing)   leds_set(1, 0, 0);          /* playing: yellow      */
+            else                leds_set(0, 0, 1);          /* paused / stopped: red */
+        }
+
+        int sc = (int)(beat_scale * 10.0f + 0.5f);
+        if (sc != shown_scale) {
+            char num[8];
+            int n;
+            shown_scale = sc;
+            scale_to_text(beat_scale, num);
+            n = put_str(line, 0, "TEMPO ");
+            n = put_str(line, n, num);
+            n = put_str(line, n, "  DOWN=faster");
+            line[n] = 0;
+            draw_small(224, line, LCD_WHITE);
+        }
+
+        xSemaphoreGive(lcd_mutex);
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 int main(void)
 {
     HAL_Init();
+    HAL_DBGMCU_EnableDBGSleepMode();      /* keep the debugger working while the CPU sleeps */
     SystemClock_Config();
     leds_init();
 
     uart_mutex = xSemaphoreCreateMutex();
+    lcd_mutex  = xSemaphoreCreateMutex();
     uart_init();
     pot_init();
 
-    xTaskCreate(audio_task,    "audio",  512, NULL, 1, NULL);
-    xTaskCreate(lcd_test_task, "lcd",    384, NULL, 1, NULL);
-    xTaskCreate(volume_task,   "volume", 512, NULL, 1, NULL);
+    note_timer    = xTimerCreate("notes",   1,                       pdFALSE, NULL, player_tick);
+    confirm_timer = xTimerCreate("confirm", pdMS_TO_TICKS(CONFIRM_MS), pdFALSE, NULL, confirm_timeout);
+
+    xTaskCreate(audio_task,              "audio",   512, NULL, 1, NULL);
+    xTaskCreate(update_lcd_leds_thread,  "lcd",     512, NULL, 1, NULL);
+    xTaskCreate(polling_buttons,         "buttons", 512, NULL, 1, NULL);
+    xTaskCreate(adjust_volume,           "volume",  512, NULL, 1, NULL);
     vTaskStartScheduler();
 
     for (;;) { }

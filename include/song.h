@@ -7,10 +7,10 @@ using namespace std;
 typedef float* ptrtoar;
 
 class Song {
-	public:
+    public:
         string name1;
         string name2;
-		ptrtoar note;
+        ptrtoar note;
         ptrtoar beat;
         float tempo;
         int length;
@@ -23,7 +23,7 @@ class Song {
             tempo = in_tempo;
             length = in_length;
         }
-        
+
 };
 
 #endif
