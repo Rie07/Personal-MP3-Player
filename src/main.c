@@ -1,12 +1,15 @@
 /*
  * BCA182 Lab 2 - Personal MP3 Player (RT-Spark, STM32F407, FreeRTOS)
  *
- * Buttons (all on board):
- *   - LEFT / RIGHT = previous / next song (starts a 5 second window).
- *   - UP = confirm the chosen song; if nothing is waiting, UP = stop / play.
+ * Buttons: B1 = UP, B2 = LEFT, B3 = DOWN, B4 = RIGHT (on board) and
+ *          USER_BUTTON = a push button on the breadboard (PA0 to GND).
+ *   - Hold LEFT / DOWN / RIGHT = song code in binary (4 / 2 / 1) = songs 1-8,
+ *     tap UP = select. The order of the keys does not matter.
+ *   - Tap UP again within 5 s = confirm (the new song plays from the start).
  *     Do nothing for 5 s = the current song carries on.
- *   - DOWN = faster tempo (wraps back to the slowest).
+ *   - USER_BUTTON: tap = stop / play, hold 1.5 s = faster tempo (wraps around).
  *   - Potentiometer (PF6) = volume.
+ *   - Only the first 8 songs of song_def.h are used (3 code keys = 8 codes).
  *
  * LEDs: Yellow = PB14 (playing), Red = PA8 (paused / stopped),
  *       Green = PA1 (changing song).
@@ -73,7 +76,7 @@
  * Duration of a note in seconds = beat x tempo x BEAT_SCALE.
  * Chosen by ear (bigger = slower). The last part of each note is a short
  * silent gap. */
-#define BEAT_SCALE       6.0f      /* start value; the DOWN key changes it */
+#define BEAT_SCALE       6.0f      /* start value; hold USER_BUTTON to make it faster */
 #define BEAT_SCALE_MIN   1.0f      /* fastest */
 #define BEAT_SCALE_MAX   12.0f     /* slowest */
 #define GAP_FRACTION     0.15f
@@ -99,11 +102,11 @@ static SemaphoreHandle_t uart_mutex;
 
 static TimerHandle_t note_timer;
 static volatile int player_playing;
-static volatile int cur_song;                      /* 0 .. SONG_COUNT-1 */
+static volatile int cur_song;                      /* 0 .. SONG_SELECTABLE-1 (8 songs) */
 static int note_idx;
 static int tick_state;                             /* 0 = start a note, 1 = gap after it */
 static TickType_t gap_ticks;
-static volatile float beat_scale = BEAT_SCALE;   /* DOWN key makes it faster */
+static volatile float beat_scale = BEAT_SCALE;   /* hold USER_BUTTON alone for faster */
 
 /* ---- song selection flow ---- */
 #define CONFIRM_MS       5000          /* time to confirm a new song       */
@@ -115,6 +118,7 @@ static volatile TickType_t confirm_deadline;
 static TimerHandle_t confirm_timer;               /* the "Timeout": one shot, 5 s */
 static SemaphoreHandle_t lcd_mutex;
 static volatile int lcd_ready;
+static volatile int user_stuck;                   /* 1 = USER_BUTTON pin reads pressed all the time */
 
 void SysTick_Handler(void)
 {
@@ -638,6 +642,14 @@ static void draw_small(uint16_t y, const char *s, uint16_t fg)
     lcd_draw_string(0, y, buf, 1, fg, LCD_BLUE);
 }
 
+static void bits_to_text(int v, char *out)       /* 3-bit binary, e.g. "101" */
+{
+    out[0] = (char)('0' + ((v >> 2) & 1));
+    out[1] = (char)('0' + ((v >> 1) & 1));
+    out[2] = (char)('0' + (v & 1));
+    out[3] = 0;
+}
+
 /* Tiny text builders (no printf in the firmware). They return the new length. */
 static int put_str(char *buf, int n, const char *s)
 {
@@ -687,22 +699,29 @@ static void draw_volume(int pct)
 /* ------------------------------------------------------------------ */
 static void print_banner(void)
 {
-    uart_print("\r\n=== Personal MP3 Player (BCA182 Lab 2) ===\r\n\r\nSongs:\r\n");
-    for (int i = 0; i < SONG_COUNT; i++) {
+    char code[5];
+
+    uart_print("\r\n=== Personal MP3 Player (BCA182 Lab 2) ===\r\n\r\n");
+    uart_print("Songs (code = LEFT DOWN RIGHT, a pressed key is 1):\r\n");
+    for (int i = 0; i < SONG_SELECTABLE; i++) {
+        bits_to_text(i, code);
         uart_print("  ");
-        uart_print_int(i + 1);
-        uart_print(". ");
+        uart_print(code);
+        uart_print("  ");
         uart_print(song_name1(i));
         uart_print(" ");
         uart_print(song_name2(i));
         uart_print("\r\n");
     }
-    uart_print("\r\nHow to use:\r\n");
-    uart_print(" LEFT / RIGHT : choose the previous / next song.\r\n");
-    uart_print(" UP           : confirm the chosen song within 5 seconds; if you do nothing,\r\n");
-    uart_print("                the current song carries on. With no choice pending, UP = stop / play.\r\n");
-    uart_print(" DOWN         : faster tempo (wraps back to the slowest).\r\n");
-    uart_print(" Potentiometer: volume.\r\n\r\n");
+    uart_print("\r\nHow to use (buttons 1-4 = UP, LEFT, DOWN, RIGHT):\r\n");
+    uart_print(" 1. Hold LEFT / DOWN / RIGHT to make the song code in binary.\r\n");
+    uart_print("    With no key held the code is 000 = the first song.\r\n");
+    uart_print(" 2. While holding them, tap UP to select the song (the key order does not matter).\r\n");
+    uart_print(" 3. Tap UP again within 5 seconds to confirm. If you do nothing, the current\r\n");
+    uart_print("    song carries on.\r\n");
+    uart_print(" 4. Tap the breadboard USER_BUTTON to stop / play.\r\n");
+    uart_print("    Hold it for 1.5 seconds to make the tempo faster (wraps to the slowest).\r\n");
+    uart_print(" 5. Turn the potentiometer to change the volume.\r\n\r\n");
     uart_print("LEDs: yellow = playing, red = paused / stopped, green = changing song.\r\n\r\n");
 }
 
@@ -747,6 +766,11 @@ static void adjust_volume(void *arg)
 #define KEY_LEFT_PIN   GPIO_PIN_0
 #define KEY_RIGHT_PIN  GPIO_PIN_4
 
+/* USER_BUTTON (stop / play): a push button on the breadboard between this pin and GND.
+ * Change these two lines if you wired it to another free pin. */
+#define USER_BTN_PORT  GPIOA
+#define USER_BTN_PIN   GPIO_PIN_0
+
 static void keys_init(void)
 {
     GPIO_InitTypeDef g = {0};
@@ -757,11 +781,20 @@ static void keys_init(void)
     g.Speed = GPIO_SPEED_FREQ_LOW;
     g.Pin   = KEY_UP_PIN | KEY_DOWN_PIN | KEY_LEFT_PIN | KEY_RIGHT_PIN;
     HAL_GPIO_Init(GPIOC, &g);
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    g.Pin = USER_BTN_PIN;                     /* same input + pull-up setup */
+    HAL_GPIO_Init(USER_BTN_PORT, &g);
 }
 
 static int key_pressed(uint16_t pin)
 {
     return HAL_GPIO_ReadPin(GPIOC, pin) == GPIO_PIN_RESET;
+}
+
+static int user_pressed(void)
+{
+    return HAL_GPIO_ReadPin(USER_BTN_PORT, USER_BTN_PIN) == GPIO_PIN_RESET;
 }
 
 /* The "Timeout": runs once, 5 s after a song was selected. Nothing was
@@ -783,21 +816,7 @@ static void announce(const char *prefix, int song)
     uart_print(song_name2(song));
 }
 
-/* LEFT / RIGHT: move to the previous / next song and (re)start the 5 s window. */
-static void browse(int dir)
-{
-    int s = (ui_state == UI_CONFIRM) ? pending_song : cur_song;
-
-    pending_song = (s + SONG_COUNT + dir) % SONG_COUNT;
-    confirm_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIRM_MS);
-    ui_state = UI_CONFIRM;
-    xTimerChangePeriod(confirm_timer, pdMS_TO_TICKS(CONFIRM_MS), 0);   /* restarts the Timeout */
-
-    announce("Choose song ", pending_song);
-    uart_print("  - press UP within 5 seconds to confirm\r\n");
-}
-
-/* UP while a song is waiting for confirmation: switch to it and play it. */
+/* Second tap of UP: switch to the chosen song and play it from the start. */
 static void confirm_song(void)
 {
     int declared, notes, beats;
@@ -819,7 +838,29 @@ static void confirm_song(void)
     uart_print(")\r\n");
 }
 
-/* UP with nothing waiting for confirmation: stop / play. */
+/* UP tapped. bits = the song code seen on LEFT / DOWN / RIGHT while UP was down. */
+static void on_up_tap(int bits)
+{
+    char code[5];
+
+    if (ui_state == UI_IDLE) {
+        /* first tap: choose the song and start the 5 second window */
+        pending_song = bits;                             /* 0 .. 7 */
+        confirm_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIRM_MS);
+        ui_state = UI_CONFIRM;
+        xTimerChangePeriod(confirm_timer, pdMS_TO_TICKS(CONFIRM_MS), 0);   /* the Timeout */
+
+        bits_to_text(bits, code);
+        announce("Selected song ", bits);
+        uart_print(" (code ");
+        uart_print(code);
+        uart_print("). Tap UP again within 5 seconds to confirm.\r\n");
+    } else {
+        confirm_song();                                  /* second tap: confirm */
+    }
+}
+
+/* USER_BUTTON tapped: stop / play. */
 static void toggle_play(void)
 {
     if (player_playing) {
@@ -831,7 +872,7 @@ static void toggle_play(void)
     }
 }
 
-/* DOWN: faster tempo, 15 % per press; after the fastest it wraps to the slowest. */
+/* USER_BUTTON held for 1 s: faster tempo, 15 % per hold; wraps to the slowest. */
 static void change_speed(void)
 {
     char b[8];
@@ -847,34 +888,66 @@ static void change_speed(void)
 }
 
 /* Handout name: polling_buttons thread. A key counts after it reads the
- * same twice in a row, 20 ms apart (debounce); each press acts once.
- *   LEFT / RIGHT = previous / next song     UP = confirm, or stop / play
- *   DOWN = faster tempo */
+ * same twice in a row, 20 ms apart (debounce).
+ *
+ *   Song code : every LEFT / DOWN / RIGHT key seen while UP is down counts, so
+ *               the order of the keys does not matter. UP acts when released.
+ *   USER_BUTTON: a tap = stop / play, a 1 second hold = faster tempo. */
 static void polling_buttons(void *arg)
 {
     (void)arg;
-    int last_raw[4] = { 0, 0, 0, 0 };
-    int stable[4]   = { 0, 0, 0, 0 };     /* 0 = UP, 1 = LEFT, 2 = DOWN, 3 = RIGHT */
+    int last_raw[5] = { 0, 0, 0, 0, 0 };
+    int stable[5]   = { 0, 0, 0, 0, 0 };  /* 0 = UP, 1 = LEFT, 2 = DOWN, 3 = RIGHT, 4 = USER */
+    int up_bits = 0;
+    TickType_t user_down_at = 0;
+    int user_long_done = 0;
+    int user_armed = 0;                   /* 0 until the USER pin has been seen released */
+    int stuck_reported = 0;
 
     keys_init();
 
     for (;;) {
-        int raw[4] = { key_pressed(KEY_UP_PIN),   key_pressed(KEY_LEFT_PIN),
-                       key_pressed(KEY_DOWN_PIN), key_pressed(KEY_RIGHT_PIN) };
-        int prev[4] = { stable[0], stable[1], stable[2], stable[3] };
+        int user_pin = user_pressed();
+        if (!user_pin) user_armed = 1;
+        int raw[5] = { key_pressed(KEY_UP_PIN),   key_pressed(KEY_LEFT_PIN),
+                       key_pressed(KEY_DOWN_PIN), key_pressed(KEY_RIGHT_PIN),
+                       user_pin && user_armed };
+        int prev[5] = { stable[0], stable[1], stable[2], stable[3], stable[4] };
+        TickType_t now = xTaskGetTickCount();
 
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
             if (raw[i] == last_raw[i]) stable[i] = raw[i];
             last_raw[i] = raw[i];
         }
-
-        if (stable[0] && !prev[0]) {                     /* UP pressed */
-            if (ui_state == UI_CONFIRM) confirm_song();
-            else                        toggle_play();
+        /* A USER_BUTTON that reads pressed from the start (never released) is ignored,
+         * so the song code keys still work, and a warning is shown. */
+        user_stuck = (!user_armed && now > pdMS_TO_TICKS(2000));
+        if (user_stuck && !stuck_reported) {
+            stuck_reported = 1;
+            uart_print("USER_BUTTON reads pressed all the time, so it is ignored. Check its wiring\r\n"
+                       "(use two legs on opposite sides of the button) or try another pin.\r\n");
         }
-        if (stable[1] && !prev[1]) browse(-1);           /* LEFT pressed  */
-        if (stable[3] && !prev[3]) browse(+1);           /* RIGHT pressed */
-        if (stable[2] && !prev[2]) change_speed();       /* DOWN pressed  */
+
+        int bits = (stable[1] << 2) | (stable[2] << 1) | stable[3];      /* LEFT = 4, DOWN = 2, RIGHT = 1 */
+
+        /* --- button 1 (UP) with the song code on buttons 2-4  --- */
+        if (stable[0] && !prev[0]) up_bits = 0;          /* UP went down */
+        if (stable[0]) up_bits |= bits;                  /* collect the code */
+        if (!stable[0] && prev[0]) on_up_tap(up_bits);   /* UP released */
+
+        /* --- USER_BUTTON: tap = stop / play, hold 1.5 s = faster tempo --- */
+        if (stable[4] && !prev[4]) {
+            user_down_at = now;
+            user_long_done = 0;
+        }
+        if (stable[4] && !user_long_done &&
+            (now - user_down_at) >= pdMS_TO_TICKS(1500)) {
+            user_long_done = 1;                          /* held 1.5 s: faster tempo */
+            change_speed();
+        }
+        if (!stable[4] && prev[4] && !user_long_done) {  /* tapped and released */
+            toggle_play();
+        }
 
         if (confirm_expired) {
             confirm_expired = 0;
@@ -892,14 +965,14 @@ static void polling_buttons(void *arg)
 static void update_lcd_leds_thread(void *arg)
 {
     (void)arg;
-    int shown_song = -1, shown_confirm = -1, shown_status = -1, shown_scale = -1;
-    char line[24];
+    int shown_song = -1, shown_confirm = -1, shown_status = -1, shown_scale = -1, shown_held = -1;
+    char line[40];                        /* longest text: the tempo line */
 
     xSemaphoreTake(lcd_mutex, portMAX_DELAY);
     lcd_init();
     lcd_fill(LCD_BLUE);                                      /* clear the display */
     lcd_draw_string(0, 2, "MP3 PLAYER", 3, LCD_WHITE, LCD_BLUE);   /* 10 chars x 24 px = 240 px */
-    draw_small(212, "L/R=song UP=OK/play DOWN=tempo", LCD_WHITE);
+    draw_small(212, "UP=select/OK  USER=stop/play", LCD_WHITE);
     xSemaphoreGive(lcd_mutex);
     lcd_ready = 1;
     if (volume_pct >= 0) draw_volume(volume_pct);
@@ -931,11 +1004,10 @@ static void update_lcd_leds_thread(void *arg)
             int n;
             shown_song = song;
             shown_confirm = confirming;
-            n = put_str(line, 0, confirming ? "CHANGE TO " : "SONG ");   /* "SONG 3/10" */
+            n = put_str(line, 0, confirming ? "CHANGE TO " : "SONG ");   /* "SONG n   bbb" */
             n = put_uint(line, n, song + 1);
-            n = put_str(line, n, "/");
-            n = put_uint(line, n, SONG_COUNT);
-            line[n] = 0;
+            n = put_str(line, n, confirming ? " " : "   ");
+            bits_to_text(song, &line[n]);
             draw_field(52,  line, confirming ? LCD_GREEN : LCD_YELLOW);
             draw_field(84,  song_name1(song), LCD_WHITE);
             draw_field(116, song_name2(song), LCD_WHITE);
@@ -969,6 +1041,30 @@ static void update_lcd_leds_thread(void *arg)
             else                leds_set(0, 0, 1);          /* paused / stopped: red */
         }
 
+        /* live keys: shows which keys are pressed right now (raw, not debounced) */
+        int warn = user_stuck;
+        int held = (key_pressed(KEY_UP_PIN) << 4) | (key_pressed(KEY_LEFT_PIN) << 3) |
+                   (key_pressed(KEY_DOWN_PIN) << 2) | (key_pressed(KEY_RIGHT_PIN) << 1) |
+                   (warn ? 0 : user_pressed());
+        int shown = held | (warn << 8);
+        if (shown != shown_held) {
+            shown_held = shown;
+            if (held == 0) {
+                if (warn) draw_small(212, "USER BTN STUCK: CHECK WIRING", LCD_RED);
+                else      draw_small(212, "UP=select/OK  USER=stop/play", LCD_WHITE);
+            } else {
+                char t[34];
+                int n = put_str(t, 0, "HELD:");
+                if (held & 16) n = put_str(t, n, " UP");
+                if (held & 8)  n = put_str(t, n, " LEFT");
+                if (held & 4)  n = put_str(t, n, " DOWN");
+                if (held & 2)  n = put_str(t, n, " RIGHT");
+                if (held & 1)  n = put_str(t, n, " USER");
+                t[n] = 0;
+                draw_small(212, t, LCD_YELLOW);
+            }
+        }
+
         int sc = (int)(beat_scale * 10.0f + 0.5f);
         if (sc != shown_scale) {
             char num[8];
@@ -977,7 +1073,7 @@ static void update_lcd_leds_thread(void *arg)
             scale_to_text(beat_scale, num);
             n = put_str(line, 0, "TEMPO ");
             n = put_str(line, n, num);
-            n = put_str(line, n, "  DOWN=faster");
+            n = put_str(line, n, "  USER 1.5s=faster");
             line[n] = 0;
             draw_small(224, line, LCD_WHITE);
         }

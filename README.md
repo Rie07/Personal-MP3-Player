@@ -1,33 +1,34 @@
-# Personal MP3 Player (BCA182 Laboratory Activity 2)
+# Personal MP3 Player
 
 A small MP3-style music player for the **RT-Thread RT-Spark** development board (STM32F407),
 built with **PlatformIO**, the **STM32Cube HAL** (no Arduino) and **FreeRTOS**.
 
 - Course: BCA182 Embedded Systems Programming, Mindanao State University - Iligan Institute of Technology
-- Authors: Renato G. Beroy, Sherie Grace L. Lupoz, Binyusoph P. Sansarona
+- Authors: Sherie Grace L. Lupoz, Renato G. Beroy, Binyusoph P. Sansarona
 - Board: RT-Spark (STM32F407ZGT6, 168 MHz, 8 MHz crystal)
 
 ## What it does
 
 - Plays the songs defined in `song_def.h` through the board's ES8388 audio codec (headphone jack).
 - Shows the song name, the player state and the volume on the on-board 240x240 LCD.
-- Lets you browse the songs with the on-board keys, with a 5 second confirmation window.
+- Lets you choose a song with a binary code on the board's keys, with a 5 second confirmation window.
 - Shows the player state on three LEDs.
 - Volume is controlled with a potentiometer.
 - Prints the instructions and the song list over UART when it starts.
 
 ## Controls
 
-All controls use the four on-board keys.
+Buttons 1-4 are the four on-board keys (UP, LEFT, DOWN, RIGHT). The USER_BUTTON is a push button on the breadboard.
 
-| Key | Action |
+| Input | Action |
 |---|---|
-| LEFT / RIGHT | Choose the previous / next song. This starts a 5 second window. |
-| UP | Confirm the chosen song, and it plays from the start. With no song waiting, UP stops / plays. |
-| DOWN | Faster tempo (wraps back to the slowest after the fastest). |
-| Potentiometer | Volume. |
-
-If you do nothing for 5 seconds after choosing a song, the choice is cancelled and the current song carries on.
+| Hold LEFT / DOWN / RIGHT | Song code in binary (LEFT = 4, DOWN = 2, RIGHT = 1) |
+| Tap UP (button 1) | Select the song. The order of the keys does not matter. |
+| Tap UP again within 5 s | Confirm. The new song plays from the start. |
+| Do nothing for 5 s | The choice is cancelled and the current song carries on. |
+| USER_BUTTON, tap | Stop / play |
+| USER_BUTTON, hold 1.5 s | Faster tempo (wraps back to the slowest) |
+| Potentiometer | Volume |
 
 | LED | Meaning |
 |---|---|
@@ -37,16 +38,21 @@ If you do nothing for 5 seconds after choosing a song, the choice is cancelled a
 
 ## Songs
 
-1. Fur Elise - Beethoven
-2. Canon in D - Pachelbel
-3. Minuet in G major - Bach
-4. Turkish March - Mozart
-5. Nocturne in E flat - Chopin
-6. Waltz No. 2 - Shostakovich
-7. Nocturne in C sharp minor - Chopin
-8. Symphony No. 40 - Mozart
-9. Symphony No. 5 - Beethoven
-10. Eine Kleine Nachtmusik - Mozart
+The handout's three code buttons give 8 codes, so the first 8 songs of `song_def.h` are used
+(the file defines 10; songs 9 and 10 are not selectable).
+
+Code = LEFT, DOWN, RIGHT (1 = pressed). With no key held, the code is 000 = the first song.
+
+| Code | Song |
+|---|---|
+| 000 | 1. Fur Elise - Beethoven |
+| 001 | 2. Canon in D - Pachelbel |
+| 010 | 3. Minuet in G major - Bach |
+| 011 | 4. Turkish March - Mozart |
+| 100 | 5. Nocturne in E flat - Chopin |
+| 101 | 6. Waltz No. 2 - Shostakovich |
+| 110 | 7. Nocturne in C sharp minor - Chopin |
+| 111 | 8. Symphony No. 40 - Mozart |
 
 ## Software design
 
@@ -55,7 +61,7 @@ Three FreeRTOS threads, named as in the handout, plus a start-up task:
 | Thread | Job |
 |---|---|
 | `update_lcd_leds_thread` | Draws the LCD and drives the LEDs. |
-| `polling_buttons` | Reads the keys (debounced) and runs the song choice / confirm logic. |
+| `polling_buttons` | Reads the keys and the USER_BUTTON (debounced) and runs the song choice / confirm logic. |
 | `adjust_volume` | Reads the potentiometer, sets the codec volume, prints the UART instructions. |
 | `audio_task` | Sets up the codec and starts the audio stream (then ends). |
 
@@ -75,12 +81,13 @@ Three FreeRTOS threads, named as in the handout, plus a start-up task:
 | Red LED | PA8 |
 | Potentiometer (ADC3 channel 4) | PF6 |
 | Keys: UP / DOWN / LEFT / RIGHT | PC5 / PC1 / PC0 / PC4 (active low) |
+| USER_BUTTON (breadboard, to GND) | PA0 (change `USER_BTN_PORT` / `USER_BTN_PIN` in `main.c` to use another pin) |
 | UART (USART1, 115200 baud, via ST-Link USB) | PA9 (TX), PA10 (RX) |
 | LCD (ST7789, FSMC 8-bit) | D0-D7 = PD14, PD15, PD0, PD1, PE7-PE10; RS = PD13 (A18); RD = PD4; WR = PD5; CS = PG10 (NE3); RST = PD3; BL = PF9 |
 | Audio codec control (I2C2) | PF1 (SCL), PF0 (SDA), address 0x10 |
 | Audio codec data (I2S3) | PC7 (MCK), PA15 (WS), PB3 (CK), PB5 (SD) |
 
-LEDs and the potentiometer are wired on a breadboard; everything else is on the board.
+The LEDs, the potentiometer and the USER_BUTTON are wired on a breadboard; everything else is on the board.
 
 ## Build and upload
 
@@ -106,10 +113,11 @@ and exposes the data to the C code through `songs.h`.
 
 ## Differences from the handout
 
-- Songs are chosen with LEFT / RIGHT instead of a binary code on buttons 2-4, so all 10 songs are reachable (3 buttons would only reach 8).
-- The board has four usable keys, so there is no separate USER_BUTTON: UP stops / plays when no song is waiting for confirmation.
+- The board has only four usable keys, so buttons 1-4 are the on-board keys and the USER_BUTTON is a push button on the breadboard.
+- `song_def.h` defines 10 songs, but the three code buttons only give 8 codes, so only the first 8 are used, as in the handout's objective.
 - Three single LEDs are used instead of an RGB LED (yellow stands in for blue).
-- The handout's original `main.cpp` timing code was not available, so the note length is `beat x tempo x scale` with a tempo scale tuned by ear (default 6.0, DOWN key changes it).
+- The handout's original `main.cpp` timing code was not available, so the note length is `beat x tempo x scale` with a tempo scale tuned by ear (default 6.0, USER_BUTTON held 1.5 s makes it faster).
+- The project uses PlatformIO with `main.c` (STM32 HAL + FreeRTOS), not CubeMX / CubeIDE with `main.cpp`.
 
 ## Credits
 
