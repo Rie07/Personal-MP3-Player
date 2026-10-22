@@ -124,3 +124,10 @@ and exposes the data to the C code through `songs.h`.
 - Course files `song.h` / `song_def.h` by the course staff.
 - The ES8388 start-up register sequence follows the idea of the RT-Thread ES8388 driver (Apache-2.0).
 - The LCD font table was generated from DejaVu Sans Mono Bold (free licence).
+
+## Project Documentation
+
+For detailed project documentation, circuit diagrams,
+and demonstrations, visit:
+
+[View Project on Hackster.io](https://www.hackster.io/556333/multithreaded-rt-spark-mp3-player-using-freertos-f30b88)
